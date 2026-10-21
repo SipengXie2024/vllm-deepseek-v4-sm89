@@ -981,3 +981,187 @@ def test_candidate_topk_maps_compact_offsets_to_local_tokens() -> None:
     map_candidate_topk_(indices, compact_logits, candidates)
 
     assert indices.tolist() == [[32, 39, -1, -1, 16, -1, -1, -1]]
+
+
+def _random_mxfp4_indexer_inputs(rows: int, width: int, page_size: int = 128):
+    gen = torch.Generator(device="cuda").manual_seed(rows * 7919 + width)
+    num_blocks = triton.cdiv(width, page_size) + 4
+    k_cache = torch.randint(
+        0,
+        256,
+        (num_blocks, page_size, 68),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=gen,
+    )
+    # Real page layout: [page * 64 packed e2m1 values][page * 4 ue8m0 scales].
+    k_cache.view(num_blocks, -1)[:, page_size * 64 :] = torch.randint(
+        122,
+        132,
+        (num_blocks, page_size * 4),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=gen,
+    )
+    block_tables = (
+        torch.randperm(num_blocks, device="cuda", generator=gen)[: num_blocks - 4]
+        .to(torch.int32)
+        .view(1, -1)
+        .contiguous()
+    )
+    q_values = torch.randint(
+        0, 256, (rows, HEADS, 64), dtype=torch.uint8, device="cuda", generator=gen
+    )
+    q_scales = torch.randint(
+        122, 132, (rows, HEADS, 4), dtype=torch.uint8, device="cuda", generator=gen
+    )
+    weights = torch.randn(
+        rows, HEADS, dtype=torch.float32, device="cuda", generator=gen
+    )
+    return q_values, q_scales, k_cache, weights, block_tables
+
+
+def _same_bits(a: torch.Tensor, b: torch.Tensor) -> bool:
+    return torch.equal(a.view(torch.int32), b.view(torch.int32))
+
+
+def _all_logit_paths():
+    """Dense and candidate logits for decode (next_n = 4) and packed prefill."""
+    outputs = []
+    width = 50_000
+    q_values, q_scales, k_cache, weights, block_tables = _random_mxfp4_indexer_inputs(
+        4, width
+    )
+    ends = torch.tensor(
+        [width, width - 1, width - 2, width - 3], dtype=torch.int32, device="cuda"
+    )
+    outputs.append(
+        dsv41_mxfp4_dense_logits(
+            q_values,
+            q_scales,
+            k_cache,
+            weights,
+            block_tables,
+            ends,
+            width,
+            row_repeat=4,
+        )
+    )
+    gen = torch.Generator(device="cuda").manual_seed(1)
+    candidates = torch.sort(
+        torch.randperm(width // 8, device="cuda", generator=gen)[:2048]
+    )[0].to(torch.int32)
+    outputs.append(
+        dsv41_mxfp4_candidate_logits(
+            q_values,
+            q_scales,
+            k_cache,
+            weights,
+            block_tables,
+            ends,
+            candidates.repeat(4, 1).contiguous(),
+            row_repeat=4,
+        )
+    )
+    ctx, rows = 20_000, 256
+    width = ctx + rows
+    q_values, q_scales, k_cache, weights, block_tables = _random_mxfp4_indexer_inputs(
+        rows, width
+    )
+    starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    ends = (ctx + 1 + torch.arange(rows, device="cuda")).to(torch.int32)
+    cu_seq_lens = torch.tensor([0, width], dtype=torch.int32, device="cuda")
+    token_to_seq = torch.zeros(width, dtype=torch.int32, device="cuda")
+    outputs.append(
+        dsv41_mxfp4_dense_logits(
+            q_values,
+            q_scales,
+            k_cache,
+            weights,
+            block_tables,
+            ends,
+            width,
+            row_starts=starts,
+            cu_seq_lens=cu_seq_lens,
+            token_to_seq=token_to_seq,
+        )
+    )
+    outputs.append(
+        dsv41_mxfp4_candidate_logits(
+            q_values,
+            q_scales,
+            k_cache,
+            weights,
+            block_tables,
+            ends,
+            candidates.repeat(rows, 1).contiguous(),
+            row_starts=starts,
+            cu_seq_lens=cu_seq_lens,
+            token_to_seq=token_to_seq,
+        )
+    )
+    return outputs
+
+
+@requires_cuda_and_triton
+def test_predecoded_q_is_bit_identical_to_inline_decode(monkeypatch) -> None:
+    monkeypatch.setattr(dsv41_indexer, "_use_q_predecode", lambda _device: False)
+    reference = _all_logit_paths()
+    monkeypatch.setattr(dsv41_indexer, "_use_q_predecode", lambda _device: True)
+    predecoded = _all_logit_paths()
+    for ref, out in zip(reference, predecoded):
+        assert _same_bits(ref, out)
+
+
+@requires_cuda_and_triton
+def test_predecoded_q_replays_in_cuda_graph(monkeypatch) -> None:
+    width = 20_000
+    q_values, q_scales, k_cache, weights, block_tables = _random_mxfp4_indexer_inputs(
+        4, width
+    )
+    ends = torch.full((4,), width, dtype=torch.int32, device="cuda")
+    out = torch.empty(4, width, dtype=torch.float32, device="cuda")
+
+    def run():
+        return dsv41_mxfp4_dense_logits(
+            q_values,
+            q_scales,
+            k_cache,
+            weights,
+            block_tables,
+            ends,
+            width,
+            row_repeat=4,
+            out=out,
+        )
+
+    monkeypatch.setattr(dsv41_indexer, "_use_q_predecode", lambda _device: False)
+    reference = run().clone()
+    monkeypatch.setattr(dsv41_indexer, "_use_q_predecode", lambda _device: True)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    # New q after capture: replay must decode the live q, not a stale copy.
+    gen = torch.Generator(device="cuda").manual_seed(2)
+    q_values.copy_(
+        torch.randint(
+            0, 256, q_values.shape, dtype=torch.uint8, device="cuda", generator=gen
+        )
+    )
+    q_scales.copy_(
+        torch.randint(
+            122, 132, q_scales.shape, dtype=torch.uint8, device="cuda", generator=gen
+        )
+    )
+    monkeypatch.setattr(dsv41_indexer, "_use_q_predecode", lambda _device: False)
+    expected = run().clone()
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert _same_bits(out, expected)
+    assert not _same_bits(out, reference)
