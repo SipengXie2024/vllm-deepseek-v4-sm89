@@ -6,10 +6,19 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
 from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
 from vllm.config import CUDAGraphMode
+from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.mla.indexer import (
+    DeepSeekV32IndexerDecodeMetadata,
+    DeepseekV32IndexerMetadata,
+    DeepseekV41IndexerMetadataBuilder,
+)
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
+from vllm.v1.worker.workspace import current_workspace_manager
+
 from vllm.forward_context import ForwardContext, override_forward_context
 from vllm.model_executor.kernels.attention.dsa import dsv41_indexer
 from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
@@ -21,15 +30,6 @@ from vllm.model_executor.kernels.attention.dsa.dsv41_indexer import (
     dsv41_mxfp4_dense_logits,
     map_candidate_topk_,
 )
-from vllm.triton_utils import HAS_TRITON, tl, triton
-from vllm.v1.attention.backend import CommonAttentionMetadata
-from vllm.v1.attention.backends.mla.indexer import (
-    DeepSeekV32IndexerDecodeMetadata,
-    DeepseekV32IndexerMetadata,
-    DeepseekV41IndexerMetadataBuilder,
-)
-from vllm.v1.kv_cache_interface import MLAAttentionSpec
-from vllm.v1.worker.workspace import current_workspace_manager
 
 HEADS = 32
 HEAD_DIM = 128
@@ -61,15 +61,15 @@ def _decode_nibbles_kernel(codes, values):
 
 
 @pytest.mark.parametrize(
-    ("width", "expected_grid", "expected_swap"),
+    ("width", "expected_grid"),
     [
-        (65_535 * 16, (3, 65_535), False),
-        (65_535 * 16 + 1, (65_536, 3), True),
-        (1024 * 1024, (65_536, 3), True),
+        (100, (3, 7)),
+        (65_535 * 16 + 1, (3, 16_384 // 3)),
+        (1024 * 1024, (3, 16_384 // 3)),
     ],
 )
-def test_dense_launcher_keeps_grid_y_within_cuda_limit(
-    monkeypatch, width: int, expected_grid: tuple[int, int], expected_swap: bool
+def test_dense_launcher_grid_is_rows_by_tile_programs(
+    monkeypatch, width: int, expected_grid: tuple[int, int]
 ) -> None:
     launches = []
 
@@ -82,6 +82,8 @@ def test_dense_launcher_keeps_grid_y_within_cuda_limit(
 
     monkeypatch.setattr(dsv41_indexer, "_validate_inputs", lambda *_: None)
     monkeypatch.setattr(dsv41_indexer, "_mxfp4_indexer_logits_kernel", FakeKernel())
+    monkeypatch.setattr(dsv41_indexer, "_use_q_predecode", lambda _device: False)
+    monkeypatch.setattr(dsv41_indexer, "_use_fp4_dot", lambda _device: False)
     rows = 3
     out = torch.full((rows, width), 17.0)
     actual = dsv41_indexer.dsv41_mxfp4_dense_logits(
@@ -99,8 +101,9 @@ def test_dense_launcher_keeps_grid_y_within_cuda_limit(
     assert torch.all(out == 17)
     assert len(launches) == 1
     grid, kwargs = launches[0]
+    # The grid never depends on the rows' context: CUDA graph replays stay valid.
     assert grid == expected_grid
-    assert kwargs["SWAP_GRID_AXES"] is expected_swap
+    assert "SWAP_GRID_AXES" not in kwargs
 
 
 @requires_cuda_and_triton
@@ -981,3 +984,274 @@ def test_candidate_topk_maps_compact_offsets_to_local_tokens() -> None:
     map_candidate_topk_(indices, compact_logits, candidates)
 
     assert indices.tolist() == [[32, 39, -1, -1, 16, -1, -1, -1]]
+
+
+def _random_mxfp4_indexer_inputs(rows: int, width: int, page_size: int = 128):
+    gen = torch.Generator(device="cuda").manual_seed(rows * 7919 + width)
+    num_blocks = triton.cdiv(width, page_size) + 4
+    k_cache = torch.randint(
+        0,
+        256,
+        (num_blocks, page_size, 68),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=gen,
+    )
+    # Real page layout: [page * 64 packed e2m1 values][page * 4 ue8m0 scales].
+    k_cache.view(num_blocks, -1)[:, page_size * 64 :] = torch.randint(
+        122,
+        132,
+        (num_blocks, page_size * 4),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=gen,
+    )
+    block_tables = (
+        torch.randperm(num_blocks, device="cuda", generator=gen)[: num_blocks - 4]
+        .to(torch.int32)
+        .view(1, -1)
+        .contiguous()
+    )
+    q_values = torch.randint(
+        0, 256, (rows, HEADS, 64), dtype=torch.uint8, device="cuda", generator=gen
+    )
+    q_scales = torch.randint(
+        122, 132, (rows, HEADS, 4), dtype=torch.uint8, device="cuda", generator=gen
+    )
+    weights = torch.randn(
+        rows, HEADS, dtype=torch.float32, device="cuda", generator=gen
+    )
+    return q_values, q_scales, k_cache, weights, block_tables
+
+
+def _same_bits(a: torch.Tensor, b: torch.Tensor) -> bool:
+    return torch.equal(a.view(torch.int32), b.view(torch.int32))
+
+
+def _all_logit_paths():
+    """Dense and candidate logits for decode (next_n = 4) and packed prefill."""
+    outputs = []
+    width = 50_000
+    q_values, q_scales, k_cache, weights, block_tables = _random_mxfp4_indexer_inputs(
+        4, width
+    )
+    ends = torch.tensor(
+        [width, width - 1, width - 2, width - 3], dtype=torch.int32, device="cuda"
+    )
+    outputs.append(
+        dsv41_mxfp4_dense_logits(
+            q_values,
+            q_scales,
+            k_cache,
+            weights,
+            block_tables,
+            ends,
+            width,
+            row_repeat=4,
+        )
+    )
+    gen = torch.Generator(device="cuda").manual_seed(1)
+    candidates = torch.sort(
+        torch.randperm(width // 8, device="cuda", generator=gen)[:2048]
+    )[0].to(torch.int32)
+    outputs.append(
+        dsv41_mxfp4_candidate_logits(
+            q_values,
+            q_scales,
+            k_cache,
+            weights,
+            block_tables,
+            ends,
+            candidates.repeat(4, 1).contiguous(),
+            row_repeat=4,
+        )
+    )
+    ctx, rows = 20_000, 256
+    width = ctx + rows
+    q_values, q_scales, k_cache, weights, block_tables = _random_mxfp4_indexer_inputs(
+        rows, width
+    )
+    starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    ends = (ctx + 1 + torch.arange(rows, device="cuda")).to(torch.int32)
+    cu_seq_lens = torch.tensor([0, width], dtype=torch.int32, device="cuda")
+    token_to_seq = torch.zeros(width, dtype=torch.int32, device="cuda")
+    outputs.append(
+        dsv41_mxfp4_dense_logits(
+            q_values,
+            q_scales,
+            k_cache,
+            weights,
+            block_tables,
+            ends,
+            width,
+            row_starts=starts,
+            cu_seq_lens=cu_seq_lens,
+            token_to_seq=token_to_seq,
+        )
+    )
+    outputs.append(
+        dsv41_mxfp4_candidate_logits(
+            q_values,
+            q_scales,
+            k_cache,
+            weights,
+            block_tables,
+            ends,
+            candidates.repeat(rows, 1).contiguous(),
+            row_starts=starts,
+            cu_seq_lens=cu_seq_lens,
+            token_to_seq=token_to_seq,
+        )
+    )
+    return outputs
+
+
+@requires_cuda_and_triton
+def test_predecoded_q_is_bit_identical_to_inline_decode(monkeypatch) -> None:
+    monkeypatch.setattr(dsv41_indexer, "_use_q_predecode", lambda _device: False)
+    monkeypatch.setattr(dsv41_indexer, "_use_fp4_dot", lambda _device: False)
+    reference = _all_logit_paths()
+    monkeypatch.setattr(dsv41_indexer, "_use_q_predecode", lambda _device: True)
+    predecoded = _all_logit_paths()
+    for ref, out in zip(reference, predecoded):
+        assert _same_bits(ref, out)
+
+
+@requires_cuda_and_triton
+def test_predecoded_q_replays_in_cuda_graph(monkeypatch) -> None:
+    width = 20_000
+    q_values, q_scales, k_cache, weights, block_tables = _random_mxfp4_indexer_inputs(
+        4, width
+    )
+    ends = torch.full((4,), width, dtype=torch.int32, device="cuda")
+    out = torch.empty(4, width, dtype=torch.float32, device="cuda")
+
+    def run():
+        return dsv41_mxfp4_dense_logits(
+            q_values,
+            q_scales,
+            k_cache,
+            weights,
+            block_tables,
+            ends,
+            width,
+            row_repeat=4,
+            out=out,
+        )
+
+    monkeypatch.setattr(dsv41_indexer, "_use_q_predecode", lambda _device: False)
+    monkeypatch.setattr(dsv41_indexer, "_use_fp4_dot", lambda _device: False)
+    reference = run().clone()
+    monkeypatch.setattr(dsv41_indexer, "_use_q_predecode", lambda _device: True)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    # New q after capture: replay must decode the live q, not a stale copy.
+    gen = torch.Generator(device="cuda").manual_seed(2)
+    q_values.copy_(
+        torch.randint(
+            0, 256, q_values.shape, dtype=torch.uint8, device="cuda", generator=gen
+        )
+    )
+    q_scales.copy_(
+        torch.randint(
+            122, 132, q_scales.shape, dtype=torch.uint8, device="cuda", generator=gen
+        )
+    )
+    monkeypatch.setattr(dsv41_indexer, "_use_q_predecode", lambda _device: False)
+    monkeypatch.setattr(dsv41_indexer, "_use_fp4_dot", lambda _device: False)
+    expected = run().clone()
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert _same_bits(out, expected)
+    assert not _same_bits(out, reference)
+
+
+@requires_cuda_and_triton
+@pytest.mark.parametrize(("target", "minimum"), [(1, 1), (7_000, 8), (10**9, 8)])
+def test_tile_program_count_does_not_change_logits(monkeypatch, target, minimum) -> None:
+    reference = _all_logit_paths()
+    monkeypatch.setattr(dsv41_indexer, "_LOGITS_TARGET_PROGRAMS", target)
+    monkeypatch.setattr(dsv41_indexer, "_LOGITS_MIN_TILE_PROGRAMS", minimum)
+    outputs = _all_logit_paths()
+    for ref, out in zip(reference, outputs):
+        assert _same_bits(ref, out)
+
+
+@requires_cuda_and_triton
+def test_skipped_columns_are_filled_with_neg_inf() -> None:
+    # Dense rows score only up to their context; the rest of the capture width
+    # must still read -inf, as it did when every program scored one tile.
+    width = 50_000
+    q_values, q_scales, k_cache, weights, block_tables = _random_mxfp4_indexer_inputs(
+        4, width
+    )
+    full = torch.full((4,), width, dtype=torch.int32, device="cuda")
+    ends = torch.tensor([100, 50, 7, 1], dtype=torch.int32, device="cuda")
+    reference = dsv41_mxfp4_dense_logits(
+        q_values, q_scales, k_cache, weights, block_tables, full, width, row_repeat=4
+    )
+    out = torch.full((4, width), 3.0, dtype=torch.float32, device="cuda")
+    dsv41_mxfp4_dense_logits(
+        q_values, q_scales, k_cache, weights, block_tables, ends, width, row_repeat=4, out=out
+    )
+    for row, end in enumerate(ends.tolist()):
+        assert _same_bits(out[row, :end], reference[row, :end])
+        assert torch.all(torch.isneginf(out[row, end:]))
+
+    # Packed prefill rows whose window starts past column 0: both sides filled.
+    rows, ctx = 8, 4_000
+    pwidth = ctx + rows
+    q_values, q_scales, k_cache, weights, block_tables = _random_mxfp4_indexer_inputs(
+        rows, pwidth
+    )
+    starts = torch.full((rows,), 1_000, dtype=torch.int32, device="cuda")
+    pends = (2_000 + 37 * torch.arange(rows, device="cuda")).to(torch.int32)
+    cu_seq_lens = torch.tensor([0, pwidth], dtype=torch.int32, device="cuda")
+    token_to_seq = torch.zeros(pwidth, dtype=torch.int32, device="cuda")
+    out = torch.full((rows, pwidth), 3.0, dtype=torch.float32, device="cuda")
+    dsv41_mxfp4_dense_logits(
+        q_values, q_scales, k_cache, weights, block_tables, pends, pwidth,
+        row_starts=starts, cu_seq_lens=cu_seq_lens, token_to_seq=token_to_seq, out=out,
+    )
+    for row, end in enumerate(pends.tolist()):
+        assert torch.all(torch.isneginf(out[row, :1_000]))
+        assert torch.all(torch.isfinite(out[row, 1_000:end]))
+        assert torch.all(torch.isneginf(out[row, end:]))
+
+
+@requires_cuda_and_triton
+def test_fp4_dot_path_matches_decode_path(monkeypatch) -> None:
+    # The SM120 tensor-core path scores packed FP4 directly; the decode path
+    # upcasts to BF16 first. Products are exact in both, so only the fp32
+    # accumulation order differs: logits agree to ~1 ulp and the top-k sets,
+    # which are all the indexer consumes, are identical.
+    if not dsv41_indexer._use_fp4_dot(torch.device("cuda")):
+        pytest.skip("FP4 dot path is only used on SM120")
+    fp4 = _all_logit_paths()
+    monkeypatch.setattr(dsv41_indexer, "_use_fp4_dot", lambda _device: False)
+    decoded = _all_logit_paths()
+    for a, b in zip(fp4, decoded):
+        finite = torch.isfinite(a)
+        assert torch.equal(finite, torch.isfinite(b))
+        scale = a[finite].abs().max().clamp_min(1e-30)
+        assert ((a[finite] - b[finite]).abs().max() / scale) < 1e-5
+        k = min(512, a.shape[1])
+        top_a = torch.sort(torch.topk(a, k, dim=1).indices, dim=1)[0]
+        top_b = torch.sort(torch.topk(b, k, dim=1).indices, dim=1)[0]
+        assert torch.equal(top_a, top_b)
+
+
+@requires_cuda_and_triton
+def test_fp4_dot_env_override_forces_decode_path(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_DSV41_INDEXER_FP4_DOT", "0")
+    assert not dsv41_indexer._use_fp4_dot(torch.device("cuda"))
+    monkeypatch.delenv("VLLM_DSV41_INDEXER_FP4_DOT")
+    major, _ = torch.cuda.get_device_capability()
+    assert dsv41_indexer._use_fp4_dot(torch.device("cuda")) == (major == 12)
